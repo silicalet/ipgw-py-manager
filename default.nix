@@ -2,7 +2,7 @@
 
 pkgs.python3Packages.buildPythonPackage rec {
   pname = "NEU-ipgw-manager";
-  version = "1.0.0"; # 请根据实际版本调整
+  version = "3.3"; # 与 ipgw/__init__.py 保持一致
 
   src = ./.;
 
