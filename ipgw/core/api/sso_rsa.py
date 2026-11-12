@@ -2,32 +2,109 @@ import re
 from base64 import b64decode
 from base64 import b64encode
 from secrets import token_bytes
-from urllib.parse import urljoin
+from urllib.parse import urljoin, urlparse
 
 from bs4 import BeautifulSoup
 from requests import Session
+from requests.exceptions import RequestException
 
 from .SSO_error import BackendError
 
 RSA_PADDING_OVERHEAD = 11
+SSO_ORIGIN = "https://pass.neu.edu.cn"
+KEY_SCRIPT_LIMIT = 8
+PUBLIC_KEY_PATTERN = re.compile(r'publicKeyStr\s*=\s*["\']([^"\']+)["\']')
+
+
+def _is_cas_url(url: str) -> bool:
+    parsed = urlparse(url)
+    try:
+        port = parsed.port
+    except ValueError:
+        return False
+    return parsed.scheme == "https" and parsed.hostname == "pass.neu.edu.cn" and port in (None, 443)
+
+
+def _script_name(src: str) -> str:
+    path = src.split("?", 1)[0]
+    return path.rsplit("/", 1)[-1] or src
+
+
+def _script_priority(src: str) -> int:
+    lowered = src.lower()
+    if "login_neu" in lowered:
+        return 0
+    if "login" in lowered:
+        return 1
+    if "rsa" in lowered:
+        return 2
+    return 3
+
+
+def _usable_public_key(text: str):
+    match = PUBLIC_KEY_PATTERN.search(text)
+    if not match:
+        return None
+    key = match.group(1)
+    try:
+        _decode_rsa_public_key(key)
+    except Exception:
+        return None
+    return key
 
 
 def extract_login_page_rsa_public_key(session: Session, page_soup: BeautifulSoup) -> str:
-    login_js_src = None
-    for script_tag in page_soup.find_all("script", src=True):
-        script_src = script_tag.attrs.get("src", "")
-        if "login_neu.js" in script_src:
-            login_js_src = script_src
-            break
-    if not login_js_src:
-        raise BackendError("cannot find login_neu.js from SSO login page")
+    # The key may be inline, or it may move between versioned scripts.
+    for script_tag in page_soup.find_all("script"):
+        if script_tag.get("src"):
+            continue
+        key = _usable_public_key(script_tag.get_text() or "")
+        if key:
+            return key
 
-    login_js_url = urljoin("https://pass.neu.edu.cn", login_js_src)
-    login_js_text = session.get(login_js_url).text
-    public_key_match = re.search(r'publicKeyStr\s*=\s*"([^"]+)"', login_js_text)
-    if not public_key_match:
-        raise BackendError("cannot extract publicKeyStr from login_neu.js")
-    return public_key_match.group(1)
+    scripts = []
+    seen = set()
+    for script_tag in page_soup.find_all("script", src=True):
+        src = (script_tag.get("src") or "").strip()
+        if not src or src in seen:
+            continue
+        seen.add(src)
+        scripts.append(src)
+    scripts.sort(key=_script_priority)
+
+    attempts = []
+    for src in scripts[:KEY_SCRIPT_LIMIT]:
+        name = _script_name(src)
+        script_url = urljoin(SSO_ORIGIN + "/", src)
+        if not _is_cas_url(script_url):
+            if "login" in src.lower():
+                raise BackendError("SSO login script points to an untrusted origin: " + src)
+            attempts.append(name + ": cross-origin")
+            continue
+        try:
+            response = session.get(script_url)
+        except RequestException as error:
+            attempts.append(name + ": " + str(error))
+            continue
+        status = getattr(response, "status_code", 200)
+        if status >= 400:
+            attempts.append(name + ": HTTP " + str(status))
+            continue
+        key = _usable_public_key(response.text)
+        if key:
+            return key
+        attempts.append(name + ": no usable publicKeyStr")
+
+    title_tag = page_soup.find("title")
+    title = title_tag.get_text(strip=True) if title_tag else ""
+    context = " (page title: " + title + ")" if title else ""
+    if attempts:
+        raise BackendError(
+            "cannot find a usable RSA public key from SSO login page: "
+            + "; ".join(attempts)
+            + context
+        )
+    raise BackendError("cannot find SSO login script or RSA public key" + context)
 
 
 def _read_der_tlv(der_bytes: bytes, offset: int):

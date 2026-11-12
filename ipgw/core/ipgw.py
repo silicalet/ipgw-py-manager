@@ -16,9 +16,9 @@ class IPGW:
     # 在参数中加入bypass_proxy,用以判断是否跳过系统代理
     def __init__(self, bypass_proxy: bool = False):
         self.sess = prepare_session(bypass_proxy) # 传入bypass_proxy
-        self.union_auth_page = SSO_prepare(self.sess)
         self.status = None
         self.acid = get_ipgw_session_acid(self.sess)
+        self.union_auth_page = SSO_prepare(self.sess, self.acid)
         logging.debug(f"get_ipgw_session_acid: {self.acid}")
 
     def login(self, username, password):
@@ -42,6 +42,9 @@ class IPGW:
         elif result['code'] == 1 and result['message'] == 'no_response_data_error':
             # 用户账号欠费，补交费用后没有重新连接无线网
             return LoginResult.NoResponseDataError
+        elif result['code'] == 1 and result['message'] == 'ip_already_online_error':
+            # 当前设备已经在线；重复登录按成功处理。
+            return LoginResult.UserAlreadyOnlineError
         else:
             # 程序无法解析此错误，说明程序出错。
             logging.error(f"登录时遇到未知错误：{result['code']}, {result['message']}")
